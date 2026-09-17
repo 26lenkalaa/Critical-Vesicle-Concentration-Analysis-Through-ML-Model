@@ -1,56 +1,23 @@
 """
-End-to-end Critical Vesicle/Micelle Concentration (CVC) automation.
+CVC (Critical Vesicle/Micelle Concentration) detection via supervised learning.
 
-Pipeline: raw plate-reader CSV -> per-well absorbance ratio -> per-well
-known concentration -> automated breakpoint (CVC) detection -> plot + value.
-
-No manual peak-picking or curve-reading is required once the CONFIG
-section below is filled in with your actual serial dilution parameters.
-
---------------------------------------------------------------------
-WHAT STILL NEEDS TO BE CONFIRMED BEFORE THIS OUTPUT IS TRUSTWORTHY
---------------------------------------------------------------------
-The script currently assumes:
-  1. every non-blank column in the file is one point in a single serial
-     dilution series (not separate replicates or unrelated samples)
-  2. the first column in the file is the highest concentration and each
-     subsequent column is diluted by DILUTION_FACTOR from the one before it
-  3. Blank1 is true concentration 0 (buffer/dye only, no lipid/surfactant)
-  4. TOP_CONCENTRATION_MM below is your actual top standard's concentration
-
-If any of those don't match your protocol, fix the CONFIG section (or the
-column-ordering logic in `assign_concentrations`) before trusting the
-printed CVC value. Everything downstream of CONFIG is fully automated.
---------------------------------------------------------------------
-
-Two independent methods are used to detect the breakpoint, and both are
-printed so you can sanity-check that they roughly agree:
-
-  1. K-means clustering (unsupervised ML) on the ratio values, splitting
-     wells into a "below CVC" cluster (baseline ratio) and an "above CVC"
-     cluster (shifted ratio). The CVC estimate is the midpoint, in
-     concentration space, between the last low-cluster point and the
-     first high-cluster point going down the dilution series.
-
-  2. A four-parameter sigmoid (logistic) fit of ratio vs. log10(concentration),
-     the standard approach in the CMC/CVC literature. The fitted midpoint
-     parameter, converted back out of log space, is the second CVC estimate.
+Trains a logistic regression classifier on labeled wells (above/below CVC)
+from the two confirmed dilution series in this project, then applies it
+back to those series as a sanity check.
 """
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from scipy.optimize import curve_fit
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import LeaveOneOut, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 # ----------------------------- CONFIG -------------------------------
-CSV_PATH = "Sample15_Absorbance_Spectrum.csv"
-TOP_CONCENTRATION_MM = 10.0   # TODO: replace with your real top standard concentration
-DILUTION_FACTOR = 2.0         # TODO: confirm serial dilution factor (2.0 = two-fold)
-BLANK_LABEL_CONTAINS = "Blank"  # column names containing this are treated as concentration 0
-LOW_RANGE = (400, 530)        # "low peak" search window, nm
-HIGH_RANGE = (400, 600)       # "high peak" search window, nm
-BASELINE_WAVELENGTH = 600     # nm, used for baseline subtraction
-OUTPUT_PLOT_PATH = "cvc_curve.png"
+LOW_RANGE = (400, 530)
+HIGH_RANGE = (400, 600)
+BASELINE_WAVELENGTH = 600
+OUTPUT_PLOT_PATH = "cvc_supervised.png"
 # ----------------------------------------------------------------------
 
 
@@ -58,32 +25,23 @@ def load_spectrum(csv_path):
     """Load an absorbance spectrum CSV, skipping the instrument metadata header."""
     with open(csv_path, "r") as f:
         lines = f.readlines()
-
     header_row = next(
         i for i, line in enumerate(lines) if line.strip().startswith("Wavelength,")
     )
-
     df = pd.read_csv(csv_path, skiprows=header_row, low_memory=False)
     df = df.apply(pd.to_numeric, errors="coerce")
     df = df.dropna(subset=["Wavelength"])
     df = df.dropna(axis=0, how="any")
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 
 def find_sample_peaks(df, sample_col, low_range=LOW_RANGE, high_range=HIGH_RANGE):
-    """Find one sample column's own low-range and high-range peak."""
     wl = df["Wavelength"]
     low_mask = (wl >= low_range[0]) & (wl <= low_range[1])
     high_mask = (wl >= high_range[0]) & (wl <= high_range[1])
-
     low_idx = df.loc[low_mask, sample_col].idxmax()
     high_idx = df.loc[high_mask, sample_col].idxmax()
-
-    return {
-        "low_value": df.loc[low_idx, sample_col],
-        "high_value": df.loc[high_idx, sample_col],
-    }
+    return {"low_value": df.loc[low_idx, sample_col], "high_value": df.loc[high_idx, sample_col]}
 
 
 def baseline_value(df, sample_col, baseline_wavelength=BASELINE_WAVELENGTH):
@@ -94,7 +52,6 @@ def baseline_value(df, sample_col, baseline_wavelength=BASELINE_WAVELENGTH):
 
 
 def compute_well_ratios(df):
-    """Return {well_name: ratio} for every sample column in the file."""
     sample_cols = [c for c in df.columns if c != "Wavelength"]
     ratios = {}
     for col in sample_cols:
@@ -106,116 +63,134 @@ def compute_well_ratios(df):
     return ratios
 
 
-def assign_concentrations(well_names, top_concentration, dilution_factor, blank_contains):
-    """Assign a concentration to each well under a single serial dilution series.
+# --------------------------------------------------------------------
+# Labeled training data
+#
+# Wells listed lowest to highest concentration (index position stands in
+# for concentration, since the real top standard concentration and
+# spacing were never confirmed -- see the project README). label = 0
+# below the confirmed breakpoint, 1 at or above it.
+# --------------------------------------------------------------------
 
-    First non-blank column = top_concentration; each subsequent non-blank
-    column is diluted by dilution_factor from the previous one. Any column
-    whose name contains blank_contains is assigned concentration 0.
-    """
-    concentrations = {}
-    dilution_step = 0
-    for name in well_names:
-        if blank_contains in name:
-            concentrations[name] = 0.0
-        else:
-            concentrations[name] = top_concentration / (dilution_factor ** dilution_step)
-            dilution_step += 1
-    return concentrations
-
-
-def detect_cvc_kmeans(concentrations, ratios):
-    """Unsupervised breakpoint detection via 2-cluster K-means on ratio values."""
-    wells = list(concentrations.keys())
-    conc = np.array([concentrations[w] for w in wells])
-    ratio = np.array([ratios[w] for w in wells])
-
-    order = np.argsort(-conc)  # descending concentration
-    conc, ratio = conc[order], ratio[order]
-
-    km = KMeans(n_clusters=2, n_init=10, random_state=0)
-    labels = km.fit_predict(ratio.reshape(-1, 1))
-
-    # the cluster with the higher mean ratio is "above CVC"
-    high_cluster = np.argmax(km.cluster_centers_.ravel())
-    is_high = labels == high_cluster
-
-    if is_high.all() or (~is_high).all():
-        return None  # no transition found; every well fell in one cluster
-
-    # walk down the (descending) concentration series and find where it
-    # switches from "high" to "low" cluster membership
-    for i in range(len(conc) - 1):
-        if is_high[i] and not is_high[i + 1]:
-            return (conc[i] + conc[i + 1]) / 2.0
-    return None
+TRAINING_SERIES = [
+    {
+        "csv": "Sample26_Absorbance_Spectrum.csv",
+        "wells_low_to_high": ["Un0014 (B05)", "Un0013 (B04)", "Un0012 (B03)", "Un0011 (B02)",
+                               "Un0010 (B01)", "Un0021 (A12)", "Un0020 (A11)", "Un0019 (A10)",
+                               "Un0009 (A09)", "Un0008 (A08)"],
+        "breakpoint_index": 5,  # confirmed: between index 4 (Un0010) and index 5 (Un0021)
+        "confidence": "high",
+    },
+    {
+        "csv": "Sample15_Absorbance_Spectrum.csv",
+        "wells_low_to_high": ["Un0013 (H01)", "Un0012 (G12)", "Un0011 (G11)", "Un0010 (G10)",
+                               "Un0009 (G09)", "Un0008 (G08)", "Un0007 (G07)", "Un0006 (G06)",
+                               "Un0005 (G05)", "Un0004 (G04)"],
+        "breakpoint_index": 2,  # confirmed: between index 1 (Un0012) and index 2 (Un0011)
+        "confidence": "low",   # noisy at the bottom -- see project README, Open Items
+    },
+]
 
 
-def _sigmoid(log_conc, top, bottom, midpoint_log, slope):
-    return bottom + (top - bottom) / (1.0 + np.exp(-slope * (log_conc - midpoint_log)))
+def build_training_set():
+    """Returns (X, y, meta) where X is [ratio, index_position] per well,
+    y is the above/below CVC label, and meta records provenance for
+    anyone auditing where a label came from."""
+    X, y, meta = [], [], []
+    for series in TRAINING_SERIES:
+        df = load_spectrum(series["csv"])
+        ratios = compute_well_ratios(df)
+        for i, well in enumerate(series["wells_low_to_high"]):
+            label = 0 if i < series["breakpoint_index"] else 1
+            X.append([ratios[well], i])
+            y.append(label)
+            meta.append({"csv": series["csv"], "well": well, "index": i, "label": label,
+                         "source_confidence": series["confidence"]})
+    return np.array(X, dtype=float), np.array(y, dtype=int), meta
 
 
-def detect_cvc_sigmoid(concentrations, ratios):
-    """Breakpoint via a fitted 4-parameter sigmoid of ratio vs log10(concentration)."""
-    wells = [w for w in concentrations if concentrations[w] > 0]  # log10 needs > 0
-    conc = np.array([concentrations[w] for w in wells])
-    ratio = np.array([ratios[w] for w in wells])
-    log_conc = np.log10(conc)
-
-    p0 = [ratio.max(), ratio.min(), np.median(log_conc), 1.0]
-    try:
-        popt, _ = curve_fit(_sigmoid, log_conc, ratio, p0=p0, maxfev=10000)
-    except RuntimeError:
-        return None
-
-    midpoint_log = popt[2]
-    return 10 ** midpoint_log
+def train_classifier(X, y):
+    """Logistic regression on standardized features. With only 20 labeled
+    points, leave-one-out cross-validation is used to get an honest,
+    if noisy, estimate of how well this generalizes -- a single train/test
+    split would be too small to mean much either way."""
+    model = make_pipeline(StandardScaler(), LogisticRegression())
+    loo_scores = cross_val_score(model, X, y, cv=LeaveOneOut())
+    model.fit(X, y)
+    return model, loo_scores
 
 
-def main(csv_path=CSV_PATH):
-    df = load_spectrum(csv_path)
-    ratios = compute_well_ratios(df)
-    well_names = list(ratios.keys())
-    concentrations = assign_concentrations(
-        well_names, TOP_CONCENTRATION_MM, DILUTION_FACTOR, BLANK_LABEL_CONTAINS
-    )
+def predict_breakpoint(model, ratios_low_to_high):
+    """Given a new series' ratios (ordered lowest to highest concentration),
+    predict per-well labels and report where the model's prediction flips
+    from below-CVC to above-CVC."""
+    X_new = np.array([[r, i] for i, r in enumerate(ratios_low_to_high)], dtype=float)
+    probs = model.predict_proba(X_new)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    breakpoint_idx = None
+    for i in range(len(preds) - 1):
+        if preds[i] == 0 and preds[i + 1] == 1:
+            breakpoint_idx = i + 1
+            break
+    return preds, probs, breakpoint_idx
 
-    print(f"Loaded {len(well_names)} wells from {csv_path}\n")
-    for name in well_names:
-        print(f"  {name}: concentration = {concentrations[name]:.6g}, ratio = {ratios[name]:.4f}")
 
-    cvc_kmeans = detect_cvc_kmeans(concentrations, ratios)
-    cvc_sigmoid = detect_cvc_sigmoid(concentrations, ratios)
-
-    print("\nAutomated CVC estimates:")
-    print(f"  K-means clustering breakpoint: {cvc_kmeans}")
-    print(f"  Sigmoid fit inflection point:  {cvc_sigmoid}")
-
+def plot_training_data(X, y, meta, model, out_path=OUTPUT_PLOT_PATH):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
-        conc_sorted = sorted(concentrations.values())
-        conc_arr = np.array([concentrations[w] for w in well_names])
-        ratio_arr = np.array([ratios[w] for w in well_names])
-
-        plt.figure(figsize=(7, 5))
-        plt.scatter(conc_arr, ratio_arr, label="wells")
-        if cvc_kmeans:
-            plt.axvline(cvc_kmeans, color="orange", linestyle="--", label=f"K-means CVC = {cvc_kmeans:.4g}")
-        if cvc_sigmoid:
-            plt.axvline(cvc_sigmoid, color="green", linestyle=":", label=f"Sigmoid CVC = {cvc_sigmoid:.4g}")
-        plt.xscale("log")
-        plt.xlabel("Concentration (log scale)")
-        plt.ylabel("High/low absorbance ratio")
-        plt.title("CVC determination")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(OUTPUT_PLOT_PATH, dpi=150)
-        print(f"\nPlot saved to {OUTPUT_PLOT_PATH}")
     except ImportError:
-        print("\nmatplotlib not available; skipping plot.")
+        print("matplotlib not available; skipping plot.")
+        return
+
+    markers = {"Sample26_Absorbance_Spectrum.csv": "o", "Sample15_Absorbance_Spectrum.csv": "s"}
+    colors = {0: "tab:blue", 1: "tab:red"}
+
+    plt.figure(figsize=(7, 5))
+    for m, (ratio, idx) in zip(meta, X):
+        plt.scatter(idx, ratio, marker=markers[m["csv"]], color=colors[m["label"]],
+                    s=70, edgecolor="black")
+
+    idx_range = np.linspace(X[:, 1].min(), X[:, 1].max(), 200)
+    ratio_range = np.linspace(X[:, 0].min(), X[:, 0].max(), 200)
+    grid_idx, grid_ratio = np.meshgrid(idx_range, ratio_range)
+    grid_X = np.column_stack([grid_ratio.ravel(), grid_idx.ravel()])
+    grid_probs = model.predict_proba(grid_X)[:, 1].reshape(grid_idx.shape)
+    plt.contour(grid_idx, grid_ratio, grid_probs, levels=[0.5], colors="black", linestyles="--")
+
+    plt.xlabel("Well index (ascending concentration)")
+    plt.ylabel("Absorbance ratio")
+    plt.title("Supervised CVC classifier: training wells and decision boundary\n"
+              "circle=Sample26 (high-confidence labels), square=Sample15 (low-confidence labels)\n"
+              "blue=below CVC, red=above CVC")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    print(f"\nPlot saved to {out_path}")
+
+
+def main():
+    print("Building labeled training set from the two confirmed series...")
+    X, y, meta = build_training_set()
+    print(f"  {len(y)} labeled wells ({sum(y)} above CVC, {len(y) - sum(y)} below)")
+    for m in meta:
+        print(f"    {m['csv']:35s} {m['well']:15s} index={m['index']} label={m['label']} "
+              f"(source confidence: {m['source_confidence']})")
+
+    model, loo_scores = train_classifier(X, y)
+    print(f"\nLeave-one-out CV accuracy: {loo_scores.mean():.2f} "
+          f"({int(loo_scores.sum())}/{len(loo_scores)} correct)")
+
+    print("\nPredicted breakpoint on each training series:")
+    for series in TRAINING_SERIES:
+        df = load_spectrum(series["csv"])
+        ratios = compute_well_ratios(df)
+        ratio_seq = [ratios[w] for w in series["wells_low_to_high"]]
+        preds, probs, bp_idx = predict_breakpoint(model, ratio_seq)
+        print(f"  {series['csv']}: predicted index {bp_idx} "
+              f"(confirmed index {series['breakpoint_index']})")
+
+    plot_training_data(X, y, meta, model)
 
 
 if __name__ == "__main__":
